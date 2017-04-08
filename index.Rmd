@@ -1,0 +1,261 @@
+---
+title: "Classifying Weight Lifting Excercise Correctness Using Machine Learning"
+author: "Keh-Harng Feng"
+date: "April 7, 2017"
+output: 
+    bookdown::html_document2:
+        toc: true
+        toc_float: true
+        link-citation: true
+        
+references:
+- type: paper-conference
+  id: Velloso2013
+  author:
+  - family: Velloso
+    given: E.
+  - family: Bulling
+    given: A.
+  - family: Gellersen
+    given: H.
+  - family: Ugulino
+    given: W.
+  - family: Fuks
+    given: H.
+  issued:
+    date-parts:
+    - - 2013
+  title: 'Qualitative Activity Recognition of Weight Lifting Exercises'
+  event: 'ACM SIGCHI'
+  event-place: 'Stuttgart, Germany'
+  event-date: 2013
+  URL: http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+# Synopsis
+Accelerometer data during a weight training exercise is used to build three models using different machine learning algorithms (decision tree, boosted tree and random forest) to classify the correctness of the participants' motions. Utilizing 10-fold cross-validation, random forest-based model is found to be the best with an out-of-sample accuracy of 99.9%.
+
+# Introduction
+Accelerometer sensors attached to six participants recorded data during a weight lifting exercise. Participants carried out the exercise in five different fashions according to instruction: the correct exercise specification and four different, incorrect ways  of performing the motion [@Velloso2013].
+
+This reports aims to classify the data into the five classes using different machine learning algorithms and compare their accuracies.
+
+# Data Description {#Desc}
+
+The data is downloaded and loaded into memory using the following code:
+```{r data_ingress, tidy = FALSE}
+if (!file.exists('./pml-training.csv')) {
+        download.file(url = 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv', 
+                      destfile = 'pml-training.csv')
+    }
+    
+    if (!file.exists('./pml-testing.csv')) {
+        download.file(url = 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv', 
+                      destfile = 'pml-testing.csv')
+    }
+    
+training_raw <- read.csv('pml-training.csv', na.strings = c('#DIV/0!'))
+
+testing_raw <- read.csv('pml-testing.csv', na.strings = c('#DIV/0!'))
+
+
+```
+
+A summary of the data structure can be seen in the [Appendix](#RDS). There are `r length(names(training_raw))` variables and `r nrow(training_raw)` observations. The important things to note are
+
+1. The response variable of interest is the `classe` variable in the training set. It specifies the five different motion classes as a five-level factor with levels `A`, `B`, `C`, `D` and `E`. A histogram for their distribution can be seen in Figure \@ref(fig:class-dist).
+2. Certain variables should not have any impact on `classe`. These are `X`, `user_name`, `raw_timestamp_part_1`, `raw_timestamp_part_2` and `cvtd_timestamp`.
+3. There are factor variables with massive amount of levels. They are likely misclassified by the `read.csv` routine due to string contaminations. For example, `max_roll_belt` is one of them.
+4. There are many variables such as `kurtosis_roll_belt` that are very sparse with mostly just NAs.
+
+The test set contains largely the same information with one crucial difference: there is no `classe` labels. This means it is impossible to use the test set to verify prediction accuracy. As such the analysis will proceed using a `train -> validate -> test` flow. It is explained in more detail in the [Data Partition](#Part) section.
+
+```{r class-dist, echo = FALSE, fig.cap = 'Distribution of Classes', fig.align = 'center'}
+barplot(table(training_raw$classe), ylab = 'Counts', xlab = 'Class')
+```
+
+## Data Preprocessing
+
+The data is first formatted to get rid of all variables that are sparse (ie: over 90% NAs) or do not contribute to the classifications due to its nature (such as `user_name`) and convert erroneous factors using the following code: 
+
+```{r cleanup}
+# Make copies.
+training <- training_raw
+testing <- testing_raw
+
+# Data reformat
+# Get rid of X, username, timestamps
+training <- training[, -c(2,3,4,5)] #Notice that X, the index, is not removed
+    
+# column names of those with NA only
+sparse_cols <- NULL
+
+# column names of erroneous factors (should be converted to numeric
+numeric_cols <- NULL
+
+# Identify cols that contain over 90% NA
+# Identify erroneous factors with too many levels to numeric
+for (i in 1:length(names(training))) {
+    var_name <- names(training)[i]
+    
+    if (sum(is.na(training[[var_name]]))/length(training[[var_name]]) > 0.9) {
+        sparse_cols <- c(sparse_cols, var_name)
+    } else if (class(training[[var_name]]) == 'factor') {
+        if (length(levels(training[[var_name]])) > 10) {
+            numeric_cols <- c(numeric_cols, var_name)
+        }
+    }
+}
+
+# Get rid of sparse columns
+# Convert wrong factors to numeric
+training <- training[,!(names(training) %in% sparse_cols)]
+testing <- testing[,!(names(testing) %in% sparse_cols)]
+
+for (i in 1:length(numeric_cols)) {
+    var_name <- numeric_cols[i]
+    training[[var_name]] <- as.numeric(training[[var_name]])
+    testing[[var_name]] <- as.numeric(testing[[var_name]])
+}
+
+```
+
+Predictor variables with near zero variances or high correlations with other predictors are also removed. 
+
+```{r, rm_var, message = FALSE}
+require(caret)
+
+# Remove variables with near zero variance.
+nzv <- nearZeroVar(training, saveMetrics = TRUE)
+
+training <- training[, !nzv$nzv]
+
+# Get rid of pairwise correlated predictors
+high_cor <- findCorrelation(cor(training[!(names(training) %in% c('classe'))]))
+
+training <- training[, -high_cor]
+```
+
+This leaves a training set with `r length(names(training)) - 1` predictors, down from `r length(names(training_raw)) - 1`.
+
+## Data Partition {#Part}
+As mentioned in [Data Description](#Desc), the test set provided lacks the `classe` labels, thus preventing any way to validate the model accuracy. A strategy is adopted to partition the training set into a validation set and a training subset using *stratified sampling* based on the `classe` labels. Essentially, the training set is divided so that roughly 75% of the data from each class is randomly sampled into the training subset while the rest is put in the validation set.
+
+```{r str_smp, message = FALSE, cache = FALSE}
+require(dplyr)
+
+set.seed(123)
+train_sub <- training %>% group_by(classe) %>% sample_frac(size = 0.75)
+
+validation <- training[!(training$X %in% train_sub$X),]
+
+# Finally remove the index variable X as it is no longer useful.
+train_sub <- train_sub[,-1]
+validation <- validation[,-1]
+```
+
+The models will be built using only the training subset while the out-of-sample accuracy of the model will be assessed on the validation set. The original test set will be used to generate predictions without providing any accuracy assessment.
+
+# Model Building
+
+Three different machine learning algorithms are tested. They are decision trees (`rpart`), boosted trees (`gbm`) and random forest (`rf`). All are built using 10-fold cross-validation for predictor selection. 10-fold is chosen to balance potential bias in the estimated model accuracy and variance inflation [as explained here](http://stats.stackexchange.com/questions/27730/choice-of-k-in-k-fold-cross-validation). Parallel computation is utilized for speed. 
+
+```{r ML_trees, message = FALSE}
+require(parallel)
+require(doParallel)
+require(rpart)
+require(gbm)
+require(randomForest)
+
+# Setup parallel clusters 
+# Programmed for Windows so NO FORKS!
+# Needs at least a 4 core CPU & high amount of RAM (16GB should be safe)
+cl = makeCluster(4)
+setDefaultCluster(cl)
+registerDoParallel(cl)
+
+trCon <- trainControl(method = 'cv', number = 10)
+
+set.seed(321)
+fit_rpart <- train(classe ~ ., data = train_sub, method = 'rpart', 
+                  trControl = trCon)
+
+fit_gbm <- train(classe ~ ., data = train_sub, method = 'gbm', 
+                     distribution = 'multinomial', verbose = FALSE,
+                 trControl = trCon)
+
+fit_rf <- train(classe ~ ., data = train_sub, method = 'rf', 
+                trControl = trCon)
+
+stopImplicitCluster()
+
+```
+
+The accuracy of each model, as estimated by 10-fold cross-validation, is shown below:
+
+**Decision Tree (`rpart`):**
+```{r, echo = FALSE}
+confusionMatrix(fit_rpart)
+```
+
+**Boosted Tree (`gbm`):**
+```{r, echo = FALSE}
+confusionMatrix(fit_gbm)
+```
+
+**Random Forest (`rf`):**
+```{r, echo = FALSE}
+confusionMatrix(fit_rf)
+```
+
+Based on these accuracy estimates using 10-fold cross-validation, random forest seems to be the best model. It's interesting to note that while decision tree (`rpart`) does poorly with an accuracy around 0.5, it is still better than random guessing. This is because with 5 classes the chance of randomly guessing right should be about 0.20, much lower than 0.5.
+
+# Model Evaluation
+
+Model performance metrics on the validation set can be found in the [Appendix](#Perf). As expected, all performance metrics follow the CV estimates closely. Random forest, with the highest out-of-sample accuracy, is selected to be the final model.
+
+Predictions for the original test set using the final model are shown in Table \@ref(tab:test-predict). As mentioned before, the test set lacks `classe` data, thus rendering a supervised comparison impossible. 
+
+```{r test-predict, echo = FALSE, message = FALSE}
+require(knitr)
+predict_test <- predict(fit_rf, testing)
+
+predict_result <- data.frame(prediction = predict_test, testing[,c(1,2,5)])
+
+kable(predict_result, caption = 'Predicted Classes for Test Set')
+```
+
+# Appendix
+
+## Raw Data Structure {#RDS}
+```{r, echo = FALSE}
+str(training_raw)
+```
+
+## Out of Sample Model Performance {#Perf}
+```{r predict, echo = FALSE}
+predict_rpart <- predict(fit_rpart, validation)
+predict_gbm <- predict(fit_gbm, validation)
+predict_rf <- predict(fit_rf, validation)
+```
+
+**Decision Tree (`rpart`):**
+```{r, echo = FALSE}
+confusionMatrix(predict_rpart, validation$classe)
+```
+
+**Boosted Tree (`gbm`):**
+```{r, echo = FALSE}
+confusionMatrix(predict_gbm, validation$classe)
+```
+
+**Random Forest (`rf`):**
+```{r, echo = FALSE}
+confusionMatrix(predict_rf, validation$classe)
+```
+
+# References
